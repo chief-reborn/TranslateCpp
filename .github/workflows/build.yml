@@ -17,17 +17,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 用 Ninja + MSVC 环境，不写死 Visual Studio 生成器版本：
+      # runner 镜像换版本时不会因为找不到某个 VS 实例而失败。
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build build
 
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item build/Release/TranslateCpp.exe dist
+          Copy-Item build/TranslateCpp.exe dist
           Copy-Item config.example.json, README.md, LICENSE dist
           Compress-Archive -Path dist/* -DestinationPath TranslateCpp-win64.zip
 
