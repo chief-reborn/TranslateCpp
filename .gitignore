@@ -1,0 +1,23 @@
+# 构建产物
+build/
+build-*/
+out/
+cmake-build-*/
+
+# CMake / IDE
+CMakeUserPresets.json
+.vs/
+.vscode/
+.idea/
+*.user
+*.sln
+
+# 本机配置（可能包含代理地址，不要提交）
+config.json
+
+# 编译生成的中间文件
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.zip
