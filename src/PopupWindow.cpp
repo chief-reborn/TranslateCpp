@@ -12,15 +12,22 @@ namespace
 {
     // 96 DPI 下的设计值，运行时按窗口实际 DPI 缩放
     constexpr int kMargin = 18;
+    constexpr int kGutter = 14;        // 右侧留给滚动条的宽度
+    constexpr int kBarWidth = 6;
     constexpr int kTopPadding = 16;
     constexpr int kLabelHeight = 20;
-    constexpr int kLabelGap = 6;       // 小标题到正文
-    constexpr int kBlockGap = 12;      // 正文到分隔线、分隔线到小标题
+    constexpr int kLabelGap = 6;
+    constexpr int kBlockGap = 12;
     constexpr int kBottomPadding = 16;
-    constexpr int kMinOriginalHeight = 40;
-    constexpr int kMaxOriginalHeight = 120;
+    constexpr int kMinPaneText = 60;   // 每栏至少三行
     constexpr int kMinClientHeight = 180;
-    constexpr int kMinTranslationHeight = 60;  // 拖动时译文至少保留三行
+    constexpr int kScrollLine = 24;
+
+    // 上下固定留白 + 两个小标题 + 分隔条两侧间距
+    constexpr int kFixedHeight =
+        kTopPadding + kLabelHeight + kLabelGap +
+        kBlockGap + kBlockGap + kLabelHeight + kLabelGap +
+        kBottomPadding;
 
     // IDC_ARROW / IDC_SIZENS 的宽字符版本：MinGW 默认把 IDC_* 展开成 char 版本
     const LPCWSTR kArrowCursor = MAKEINTRESOURCEW(32512);
@@ -103,38 +110,56 @@ namespace
     struct Layout
     {
         int margin = 0;
+        int gutter = 0;
+        int contentRight = 0;
+
         int originalLabelTop = 0;
         int originalLabelBottom = 0;
-        int originalTop = 0;
-        int originalHeight = 0;
+        int originalTextTop = 0;
+        int originalTextHeight = 0;
+
         int dividerY = 0;
+
         int translatedLabelTop = 0;
         int translatedLabelBottom = 0;
-        int translatedTop = 0;
+        int translatedTextTop = 0;
+        int translatedTextHeight = 0;
     };
 
-    Layout computeLayout(UINT dpi, int originalTextHeight)
+    Layout computeLayout(
+        UINT dpi,
+        int clientWidth,
+        int clientHeight,
+        int originalTextHeight)
     {
         Layout layout{};
 
         layout.margin = scaled(kMargin, dpi);
+        layout.gutter = scaled(kGutter, dpi);
+        layout.contentRight = clientWidth - layout.margin - layout.gutter;
+
         layout.originalLabelTop = scaled(kTopPadding, dpi);
         layout.originalLabelBottom =
             layout.originalLabelTop + scaled(kLabelHeight, dpi);
-        layout.originalTop =
+        layout.originalTextTop =
             layout.originalLabelBottom + scaled(kLabelGap, dpi);
-        layout.originalHeight = std::clamp(
-            originalTextHeight,
-            scaled(kMinOriginalHeight, dpi),
-            scaled(kMaxOriginalHeight, dpi));
+        layout.originalTextHeight = std::max(
+            originalTextHeight, scaled(kMinPaneText, dpi));
+
         layout.dividerY =
-            layout.originalTop + layout.originalHeight + scaled(kBlockGap, dpi);
+            layout.originalTextTop + layout.originalTextHeight +
+            scaled(kBlockGap, dpi);
+
         layout.translatedLabelTop =
             layout.dividerY + scaled(kBlockGap, dpi);
         layout.translatedLabelBottom =
             layout.translatedLabelTop + scaled(kLabelHeight, dpi);
-        layout.translatedTop =
+        layout.translatedTextTop =
             layout.translatedLabelBottom + scaled(kLabelGap, dpi);
+        layout.translatedTextHeight = std::max(
+            0,
+            clientHeight - scaled(kBottomPadding, dpi) -
+                layout.translatedTextTop);
 
         return layout;
     }
@@ -191,6 +216,41 @@ namespace
         DeleteObject(brush);
     }
 
+    void fillRoundRect(HDC hdc, const RECT &rect, int radius, COLORREF color)
+    {
+        HBRUSH brush = CreateSolidBrush(color);
+        HGDIOBJ oldBrush = SelectObject(hdc, brush);
+        HPEN nullPen = static_cast<HPEN>(GetStockObject(NULL_PEN));
+        HGDIOBJ oldPen = SelectObject(hdc, nullPen);
+
+        RoundRect(
+            hdc,
+            rect.left, rect.top,
+            rect.right, rect.bottom,
+            radius, radius);
+
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        DeleteObject(brush);
+    }
+
+    void drawScrollBar(
+        HDC hdc,
+        UINT dpi,
+        const RECT &track,
+        const RECT &thumb)
+    {
+        if (thumb.bottom <= thumb.top)
+        {
+            return;
+        }
+
+        const int radius = scaled(kBarWidth, dpi);
+
+        fillRoundRect(hdc, track, radius, RGB(244, 244, 244));
+        fillRoundRect(hdc, thumb, radius, RGB(190, 190, 190));
+    }
+
     int maxClientHeight(HWND hwnd, UINT dpi)
     {
         MONITORINFO info{};
@@ -209,34 +269,6 @@ namespace
 
         return scaled(600, dpi);
     }
-
-    // 窗口高度跟着文本走，最长不超过工作区的 80%
-    int desiredClientHeight(
-        HWND hwnd,
-        UINT dpi,
-        int clientWidth,
-        const std::wstring &original,
-        const std::wstring &translated)
-    {
-        const int contentWidth = clientWidth - 2 * scaled(kMargin, dpi);
-
-        const int originalHeight = measureTextHeight(
-            hwnd, dpi, original, contentWidth);
-
-        const Layout layout = computeLayout(dpi, originalHeight);
-
-        const int translatedHeight = measureTextHeight(
-            hwnd, dpi, translated, contentWidth);
-
-        int height = layout.translatedTop +
-                     translatedHeight +
-                     scaled(kBottomPadding, dpi);
-
-        height = std::max(height, scaled(kMinClientHeight, dpi));
-        height = std::min(height, maxClientHeight(hwnd, dpi));
-
-        return height;
-    }
 }
 
 // 注册窗口类
@@ -250,9 +282,7 @@ bool PopupWindow::initialize(HINSTANCE instance)
     wc.lpfnWndProc = PopupWindow::windowProc;
     wc.hInstance = instance_;
     wc.lpszClassName = WINDOW_CLASS_NAME;
-    wc.hCursor = LoadCursorW(
-        nullptr,
-        MAKEINTRESOURCEW(32512));
+    wc.hCursor = LoadCursorW(nullptr, kArrowCursor);
     wc.hbrBackground = nullptr;
 
     if (RegisterClassExW(&wc) != 0)
@@ -287,12 +317,14 @@ void PopupWindow::showInternal(
     translatedText_ = utf8ToWide(translated);
     isError_ = isError;
 
-    // 每次出现新内容都回到自动分配
-    splitOffset_ = 0;
+    // 新内容：两栏都回到顶部，分配恢复自动
+    originalScroll_ = 0;
+    translatedScroll_ = 0;
+    originalAlloc_ = 0;
+    activePane_ = Pane::Translated;
 
     if (hwnd_ != nullptr && IsWindow(hwnd_))
     {
-        // 文本变了，窗口高度也要跟着变
         resizeToContent(hwnd_);
 
         InvalidateRect(hwnd_, nullptr, TRUE);
@@ -343,7 +375,7 @@ void PopupWindow::showInternal(
     UpdateWindow(hwnd_);
 }
 
-// 按内容计算窗口大小，并把窗口收回当前显示器的工作区
+// 按内容计算窗口大小，并给两栏做默认分配
 void PopupWindow::resizeToContent(HWND hwnd)
 {
     if (hwnd == nullptr || !IsWindow(hwnd))
@@ -364,9 +396,47 @@ void PopupWindow::resizeToContent(HWND hwnd)
 
     const UINT dpi = windowDpi(hwnd);
     const int clientWidth = scaled(BASE_WIDTH, dpi);
+    const int contentWidth =
+        clientWidth - 2 * scaled(kMargin, dpi) - scaled(kGutter, dpi);
 
-    const int clientHeight = desiredClientHeight(
-        hwnd, dpi, clientWidth, originalText_, translatedText_);
+    const int measuredOriginal = measureTextHeight(
+        hwnd, dpi, originalText_, contentWidth);
+
+    const int measuredTranslated = measureTextHeight(
+        hwnd, dpi, translatedText_, contentWidth);
+
+    const int naturalOriginal = std::max(
+        measuredOriginal, scaled(kMinPaneText, dpi));
+
+    const int naturalTranslated = std::max(
+        measuredTranslated, scaled(kMinPaneText, dpi));
+
+    const int fixedHeight = scaled(kFixedHeight, dpi);
+    const int maxHeight = maxClientHeight(hwnd, dpi);
+
+    int desired = fixedHeight + naturalOriginal + naturalTranslated;
+    int alloc = naturalOriginal;
+    int clientHeight = desired;
+
+    if (desired > maxHeight)
+    {
+        clientHeight = maxHeight;
+
+        const int available = clientHeight - fixedHeight;
+        const int total = naturalOriginal + naturalTranslated;
+
+        alloc = available * naturalOriginal / std::max(1, total);
+
+        const int minPane = scaled(kMinPaneText, dpi);
+
+        alloc = std::clamp(
+            alloc,
+            minPane,
+            std::max(minPane, available - minPane));
+    }
+
+    clientHeight = std::max(clientHeight, scaled(kMinClientHeight, dpi));
+    originalAlloc_ = alloc;
 
     int width = clientWidth + frameWidth;
     int height = clientHeight + frameHeight;
@@ -411,9 +481,10 @@ void PopupWindow::resizeToContent(HWND hwnd)
         width,
         height,
         SWP_NOACTIVATE);
+
+    clampScrolls();
 }
 
-// 分隔条中心线在客户区中的 y 坐标
 int PopupWindow::dividerCenterY() const
 {
     if (hwnd_ == nullptr || !IsWindow(hwnd_))
@@ -421,18 +492,140 @@ int PopupWindow::dividerCenterY() const
         return 0;
     }
 
-    const UINT dpi = windowDpi(hwnd_);
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+
+    const Layout layout = computeLayout(
+        windowDpi(hwnd_), client.right, client.bottom, originalAlloc_);
+
+    return layout.dividerY;
+}
+
+RECT PopupWindow::paneTextRect(Pane pane) const
+{
+    RECT client{};
+
+    if (hwnd_ == nullptr || !IsWindow(hwnd_))
+    {
+        return client;
+    }
+
+    GetClientRect(hwnd_, &client);
+
+    const Layout layout = computeLayout(
+        windowDpi(hwnd_), client.right, client.bottom, originalAlloc_);
+
+    if (pane == Pane::Original)
+    {
+        return RECT{
+            layout.margin,
+            layout.originalTextTop,
+            layout.contentRight,
+            layout.originalTextTop + layout.originalTextHeight};
+    }
+
+    return RECT{
+        layout.margin,
+        layout.translatedTextTop,
+        layout.contentRight,
+        layout.translatedTextTop + layout.translatedTextHeight};
+}
+
+int PopupWindow::paneContentHeight(Pane pane) const
+{
+    if (hwnd_ == nullptr || !IsWindow(hwnd_))
+    {
+        return 0;
+    }
 
     RECT client{};
     GetClientRect(hwnd_, &client);
 
-    const int contentWidth = client.right - 2 * scaled(kMargin, dpi);
-    const int measured = measureTextHeight(
-        hwnd_, dpi, originalText_, contentWidth);
+    const int contentWidth =
+        client.right - 2 * scaled(kMargin, windowDpi(hwnd_)) -
+        scaled(kGutter, windowDpi(hwnd_));
 
-    const Layout layout = computeLayout(dpi, measured);
+    return measureTextHeight(
+        hwnd_,
+        windowDpi(hwnd_),
+        pane == Pane::Original ? originalText_ : translatedText_,
+        contentWidth);
+}
 
-    return layout.dividerY + splitOffset_;
+int PopupWindow::paneTextHeight(Pane pane) const
+{
+    const RECT rect = paneTextRect(pane);
+
+    return rect.bottom - rect.top;
+}
+
+int PopupWindow::paneScrollMax(Pane pane) const
+{
+    return std::max(0, paneContentHeight(pane) - paneTextHeight(pane));
+}
+
+int &PopupWindow::scrollOf(Pane pane)
+{
+    return pane == Pane::Original ? originalScroll_ : translatedScroll_;
+}
+
+RECT PopupWindow::trackRect(Pane pane) const
+{
+    const RECT text = paneTextRect(pane);
+
+    if (hwnd_ == nullptr)
+    {
+        return RECT{};
+    }
+
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+
+    const UINT dpi = windowDpi(hwnd_);
+    const int barRight = client.right - scaled(kMargin, dpi);
+    const int barLeft = barRight - scaled(kBarWidth, dpi);
+
+    return RECT{barLeft, text.top, barRight, text.bottom};
+}
+
+RECT PopupWindow::thumbRect(Pane pane) const
+{
+    const int maxScroll = paneScrollMax(pane);
+
+    if (maxScroll <= 0)
+    {
+        return RECT{};
+    }
+
+    const RECT track = trackRect(pane);
+    const int trackHeight = track.bottom - track.top;
+    const int contentHeight = paneContentHeight(pane);
+    const int textHeight = paneTextHeight(pane);
+
+    if (trackHeight <= 0 || contentHeight <= 0)
+    {
+        return RECT{};
+    }
+
+    const UINT dpi = windowDpi(hwnd_);
+    const int minThumb = scaled(24, dpi);
+
+    int thumbHeight = trackHeight * textHeight / contentHeight;
+    thumbHeight = std::max(minThumb, thumbHeight);
+    thumbHeight = std::min(trackHeight, thumbHeight);
+
+    const int travel = trackHeight - thumbHeight;
+    const int offset =
+        pane == Pane::Original ? originalScroll_ : translatedScroll_;
+
+    const int thumbTop =
+        track.top + travel * offset / std::max(1, maxScroll);
+
+    return RECT{
+        track.left,
+        thumbTop,
+        track.right,
+        thumbTop + thumbHeight};
 }
 
 bool PopupWindow::isOverDivider(POINT clientPoint) const
@@ -442,15 +635,66 @@ bool PopupWindow::isOverDivider(POINT clientPoint) const
         return false;
     }
 
-    const UINT dpi = windowDpi(hwnd_);
-    const int half = scaled(7, dpi);
+    const int half = scaled(7, windowDpi(hwnd_));
     const int center = dividerCenterY();
 
     return clientPoint.y >= center - half &&
            clientPoint.y <= center + half;
 }
 
-// 拖动时限制上下限：原文至少两行，译文至少三行
+bool PopupWindow::isOverThumb(Pane pane, POINT clientPoint) const
+{
+    const RECT thumb = thumbRect(pane);
+
+    return thumb.bottom > thumb.top &&
+           PtInRect(&thumb, clientPoint) != FALSE;
+}
+
+bool PopupWindow::isOverTrack(Pane pane, POINT clientPoint) const
+{
+    if (paneScrollMax(pane) <= 0)
+    {
+        return false;
+    }
+
+    const RECT track = trackRect(pane);
+
+    return PtInRect(&track, clientPoint) != FALSE;
+}
+
+PopupWindow::Pane PopupWindow::paneAt(POINT clientPoint) const
+{
+    return clientPoint.y < dividerCenterY()
+               ? Pane::Original
+               : Pane::Translated;
+}
+
+void PopupWindow::clampScrolls()
+{
+    for (const Pane pane : {Pane::Original, Pane::Translated})
+    {
+        int &scroll = scrollOf(pane);
+        scroll = std::clamp(scroll, 0, paneScrollMax(pane));
+    }
+}
+
+void PopupWindow::scrollPaneBy(Pane pane, int delta)
+{
+    int &scroll = scrollOf(pane);
+
+    const int target = std::clamp(
+        scroll + delta, 0, paneScrollMax(pane));
+
+    if (target == scroll)
+    {
+        return;
+    }
+
+    scroll = target;
+    InvalidateRect(hwnd_, nullptr, TRUE);
+}
+
+// 拖动只调整两栏的分配，窗口总高度不变
 void PopupWindow::applySplitOffset(int offset)
 {
     if (hwnd_ == nullptr || !IsWindow(hwnd_))
@@ -458,32 +702,21 @@ void PopupWindow::applySplitOffset(int offset)
         return;
     }
 
-    const UINT dpi = windowDpi(hwnd_);
-
     RECT client{};
     GetClientRect(hwnd_, &client);
 
-    const int contentWidth = client.right - 2 * scaled(kMargin, dpi);
-    const int measured = measureTextHeight(
-        hwnd_, dpi, originalText_, contentWidth);
+    const UINT dpi = windowDpi(hwnd_);
+    const int minPane = scaled(kMinPaneText, dpi);
 
-    const Layout layout = computeLayout(dpi, measured);
+    const int maxAlloc =
+        client.bottom - scaled(kFixedHeight, dpi) - minPane;
 
-    const int natural = layout.originalHeight;
-    const int minOffset = scaled(kMinOriginalHeight, dpi) - natural;
+    originalAlloc_ = std::clamp(
+        offset,
+        minPane,
+        std::max(minPane, maxAlloc));
 
-    const int available =
-        (client.bottom - scaled(kBottomPadding, dpi)) -
-        layout.translatedTop;
-
-    const int maxOffset =
-        available - scaled(kMinTranslationHeight, dpi) - natural;
-
-    const int low = std::min(minOffset, maxOffset);
-    const int high = std::max(minOffset, maxOffset);
-
-    splitOffset_ = std::clamp(offset, low, high);
-
+    clampScrolls();
     InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
@@ -542,8 +775,22 @@ LRESULT CALLBACK PopupWindow::windowProc(
         return 0;
 
     case WM_ERASEBKGND:
-        // 绘制时整块重画，省掉一次背景擦除可以少一点闪烁
         return 1;
+
+    case WM_MOUSEWHEEL:
+    {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        ScreenToClient(hwnd, &point);
+
+        const UINT dpi = windowDpi(hwnd);
+        const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+
+        self->scrollPaneBy(
+            self->paneAt(point),
+            -delta / WHEEL_DELTA * scaled(kScrollLine, dpi) * 3);
+
+        return 0;
+    }
 
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT)
@@ -552,9 +799,14 @@ LRESULT CALLBACK PopupWindow::windowProc(
             GetCursorPos(&point);
             ScreenToClient(hwnd, &point);
 
+            const bool draggable =
+                self->isOverDivider(point) ||
+                self->isOverThumb(Pane::Original, point) ||
+                self->isOverThumb(Pane::Translated, point);
+
             SetCursor(LoadCursorW(
                 nullptr,
-                self->isOverDivider(point) ? kSizeCursor : kArrowCursor));
+                draggable ? kSizeCursor : kArrowCursor));
 
             return TRUE;
         }
@@ -566,11 +818,40 @@ LRESULT CALLBACK PopupWindow::windowProc(
             GET_X_LPARAM(lParam),
             GET_Y_LPARAM(lParam)};
 
-        if (self->dragging_)
+        if (self->draggingDivider_)
         {
             self->applySplitOffset(
-                self->dragStartOffset_ +
-                (point.y - self->dragStart_.y));
+                self->dividerDragStartAlloc_ +
+                (point.y - self->dividerDragStartY_));
+
+            return 0;
+        }
+
+        if (self->draggingThumb_)
+        {
+            const Pane pane = self->thumbPane_;
+            const RECT track = self->trackRect(pane);
+            const RECT thumb = self->thumbRect(pane);
+
+            const int travel =
+                (track.bottom - track.top) - (thumb.bottom - thumb.top);
+
+            const int maxScroll = self->paneScrollMax(pane);
+
+            if (travel > 0 && maxScroll > 0)
+            {
+                const int delta = point.y - self->thumbDragStartY_;
+
+                int &scroll = self->scrollOf(pane);
+
+                scroll = std::clamp(
+                    self->thumbDragStartScroll_ +
+                        delta * maxScroll / travel,
+                    0,
+                    maxScroll);
+
+                InvalidateRect(hwnd, nullptr, TRUE);
+            }
 
             return 0;
         }
@@ -620,22 +901,51 @@ LRESULT CALLBACK PopupWindow::windowProc(
         if (self->isOverDivider(point))
         {
             SetCapture(hwnd);
-            SetCursor(LoadCursorW(nullptr, kSizeCursor));
 
-            self->dragging_ = true;
-            self->dragStart_ = point;
-            self->dragStartOffset_ = self->splitOffset_;
+            self->draggingDivider_ = true;
+            self->dividerDragStartY_ = point.y;
+            self->dividerDragStartAlloc_ = self->originalAlloc_;
+            return 0;
         }
 
+        for (const Pane pane : {Pane::Original, Pane::Translated})
+        {
+            if (self->isOverThumb(pane, point))
+            {
+                SetCapture(hwnd);
+
+                self->draggingThumb_ = true;
+                self->thumbPane_ = pane;
+                self->thumbDragStartY_ = point.y;
+                self->thumbDragStartScroll_ = self->scrollOf(pane);
+                return 0;
+            }
+        }
+
+        for (const Pane pane : {Pane::Original, Pane::Translated})
+        {
+            if (self->isOverTrack(pane, point))
+            {
+                const RECT text = self->paneTextRect(pane);
+
+                self->scrollPaneBy(
+                    pane,
+                    point.y < self->thumbRect(pane).top
+                        ? -(text.bottom - text.top)
+                        : (text.bottom - text.top));
+
+                return 0;
+            }
+        }
+
+        self->activePane_ = self->paneAt(point);
         break;
     }
 
     case WM_LBUTTONUP:
-        if (self->dragging_)
-        {
-            self->dragging_ = false;
-            ReleaseCapture();
-        }
+        self->draggingDivider_ = false;
+        self->draggingThumb_ = false;
+        ReleaseCapture();
         break;
 
     case WM_LBUTTONDBLCLK:
@@ -644,26 +954,65 @@ LRESULT CALLBACK PopupWindow::windowProc(
             GET_X_LPARAM(lParam),
             GET_Y_LPARAM(lParam)};
 
-        // 双击恢复按内容自动分配
         if (self->isOverDivider(point))
         {
-            self->applySplitOffset(0);
+            // 双击恢复默认分配
+            self->resizeToContent(hwnd);
         }
 
         break;
     }
 
     case WM_CAPTURECHANGED:
-        self->dragging_ = false;
+        self->draggingDivider_ = false;
+        self->draggingThumb_ = false;
         break;
 
     case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE)
+    {
+        const UINT dpi = windowDpi(hwnd);
+        const int line = scaled(kScrollLine, dpi);
+
+        int page = 0;
+
+        switch (wParam)
         {
+        case VK_ESCAPE:
             DestroyWindow(hwnd);
             return 0;
+
+        case VK_UP:
+            self->scrollPaneBy(self->activePane_, -line);
+            return 0;
+
+        case VK_DOWN:
+            self->scrollPaneBy(self->activePane_, line);
+            return 0;
+
+        case VK_PRIOR:
+            page = self->paneTextHeight(self->activePane_) - line;
+            self->scrollPaneBy(self->activePane_, -page);
+            return 0;
+
+        case VK_NEXT:
+            page = self->paneTextHeight(self->activePane_) - line;
+            self->scrollPaneBy(self->activePane_, page);
+            return 0;
+
+        case VK_HOME:
+            self->scrollPaneBy(self->activePane_, -1000000);
+            return 0;
+
+        case VK_END:
+            self->scrollPaneBy(self->activePane_, 1000000);
+            return 0;
+
+        default:
+            break;
         }
+
         break;
+    }
 
     case WM_CLOSE:
         DestroyWindow(hwnd);
@@ -683,8 +1032,9 @@ LRESULT CALLBACK PopupWindow::windowProc(
             suggested->bottom - suggested->top,
             SWP_NOZORDER | SWP_NOACTIVATE);
 
-        // 偏移量是按旧 DPI 算出来的，换屏后直接复位
-        self->splitOffset_ = 0;
+        self->originalScroll_ = 0;
+        self->translatedScroll_ = 0;
+        self->originalAlloc_ = 0;
 
         self->resizeToContent(hwnd);
         InvalidateRect(hwnd, nullptr, TRUE);
@@ -720,9 +1070,7 @@ void PopupWindow::paint(HWND hwnd)
     RECT clientRect{};
     GetClientRect(hwnd, &clientRect);
 
-    HBRUSH background = CreateSolidBrush(
-        RGB(255, 255, 255));
-
+    HBRUSH background = CreateSolidBrush(RGB(255, 255, 255));
     FillRect(hdc, &clientRect, background);
     DeleteObject(background);
 
@@ -730,28 +1078,16 @@ void PopupWindow::paint(HWND hwnd)
 
     const UINT dpi = windowDpi(hwnd);
 
-    const int contentWidth =
-        clientRect.right - 2 * scaled(kMargin, dpi);
-
-    const int measuredOriginal = measureTextHeight(
-        hwnd, dpi, originalText_, contentWidth);
-
-    Layout layout = computeLayout(dpi, measuredOriginal);
-
-    // 拖动分隔条后，原文区变高、下面整块跟着下移
-    layout.originalHeight += splitOffset_;
-    layout.dividerY += splitOffset_;
-    layout.translatedLabelTop += splitOffset_;
-    layout.translatedLabelBottom += splitOffset_;
-    layout.translatedTop += splitOffset_;
-
-    const int margin = layout.margin;
-    const int right = clientRect.right - margin;
+    const Layout layout = computeLayout(
+        dpi, clientRect.right, clientRect.bottom, originalAlloc_);
 
     HFONT bodyFont = createUiFont(dpi, 14);
     HFONT labelFont = createUiFont(dpi, 12);
 
     HGDIOBJ oldFont = SelectObject(hdc, labelFont);
+
+    const int margin = layout.margin;
+    const int right = layout.contentRight;
 
     // 原文标题
     SetTextColor(hdc, RGB(110, 110, 110));
@@ -769,36 +1105,7 @@ void PopupWindow::paint(HWND hwnd)
         &originalLabel,
         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 
-    // 原文内容
-    SelectObject(hdc, bodyFont);
-    SetTextColor(hdc, RGB(70, 70, 70));
-
-    RECT originalRect{
-        margin,
-        layout.originalTop,
-        right,
-        layout.originalTop + layout.originalHeight};
-
-    DrawTextW(
-        hdc,
-        originalText_.c_str(),
-        -1,
-        &originalRect,
-        DT_LEFT | DT_WORDBREAK | DT_WORD_ELLIPSIS | DT_NOPREFIX);
-
-    // 可拖动的分隔条
-    drawDivider(
-        hdc,
-        dpi,
-        margin,
-        right,
-        layout.dividerY,
-        dividerHover_ || dragging_);
-
     // 译文标题
-    SelectObject(hdc, labelFont);
-    SetTextColor(hdc, RGB(110, 110, 110));
-
     RECT translatedLabel{
         margin,
         layout.translatedLabelTop,
@@ -812,24 +1119,76 @@ void PopupWindow::paint(HWND hwnd)
         &translatedLabel,
         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 
-    // 译文内容（失败时显示错误原因）
     SelectObject(hdc, bodyFont);
-    SetTextColor(
-        hdc,
+
+    // 两栏正文各自裁剪、各自滚动
+    const auto drawPaneText =
+        [&](const std::wstring &text, const RECT &rect, int scroll,
+            COLORREF color)
+    {
+        const int contentHeight = measureTextHeight(
+            hwnd, dpi, text, rect.right - rect.left);
+
+        const int saved = SaveDC(hdc);
+
+        IntersectClipRect(hdc, rect.left, rect.top, rect.right, rect.bottom);
+
+        SetTextColor(hdc, color);
+
+        RECT textRect{
+            rect.left,
+            rect.top - scroll,
+            rect.right,
+            rect.top - scroll + contentHeight};
+
+        DrawTextW(
+            hdc,
+            text.c_str(),
+            -1,
+            &textRect,
+            DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+
+        RestoreDC(hdc, saved);
+    };
+
+    const RECT originalRect{
+        margin,
+        layout.originalTextTop,
+        right,
+        layout.originalTextTop + layout.originalTextHeight};
+
+    drawPaneText(
+        originalText_, originalRect, originalScroll_, RGB(70, 70, 70));
+
+    const RECT translatedRect{
+        margin,
+        layout.translatedTextTop,
+        right,
+        layout.translatedTextTop + layout.translatedTextHeight};
+
+    drawPaneText(
+        translatedText_,
+        translatedRect,
+        translatedScroll_,
         isError_ ? RGB(190, 45, 45) : RGB(25, 25, 25));
 
-    RECT translatedRect{
-        margin,
-        layout.translatedTop,
-        right,
-        clientRect.bottom - scaled(kBottomPadding, dpi)};
-
-    DrawTextW(
+    // 分隔条
+    drawDivider(
         hdc,
-        translatedText_.c_str(),
-        -1,
-        &translatedRect,
-        DT_LEFT | DT_WORDBREAK | DT_WORD_ELLIPSIS | DT_NOPREFIX);
+        dpi,
+        margin,
+        right,
+        layout.dividerY,
+        dividerHover_ || draggingDivider_);
+
+    // 两栏的滚动条
+    for (const Pane pane : {Pane::Original, Pane::Translated})
+    {
+        const RECT track = trackRect(pane);
+        const RECT thumb = thumbRect(pane);
+
+        drawScrollBar(hdc, dpi, track, thumb);
+    }
 
     SelectObject(hdc, oldFont);
 
