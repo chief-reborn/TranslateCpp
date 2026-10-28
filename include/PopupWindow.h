@@ -34,10 +34,28 @@ private:
     std::wstring translatedText_;
     bool isError_ = false;
 
+    // 分隔条拖动：正数表示原文区加高、译文区相应变矮
+    int splitOffset_ = 0;
+    bool dragging_ = false;
+    bool dividerHover_ = false;
+    bool trackingMouse_ = false;
+    POINT dragStart_{};
+    int dragStartOffset_ = 0;
+
     void showInternal(
         const std::string &original,
         const std::string &translated,
         bool isError);
+
+    // 按文本实际高度调整窗口大小
+    void resizeToContent(HWND hwnd);
+
+    // 分隔条位置（客户区坐标）与命中判断
+    [[nodiscard]] int dividerCenterY() const;
+    [[nodiscard]] bool isOverDivider(POINT clientPoint) const;
+
+    // 调整原文/译文的高度分配
+    void applySplitOffset(int offset);
 
     // 96 DPI 下的基准尺寸，实际按窗口所在显示器的 DPI 缩放
     static constexpr int BASE_WIDTH = 560;
