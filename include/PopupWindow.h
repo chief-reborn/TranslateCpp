@@ -30,6 +30,10 @@ public:
     // 原文被修改后按 Ctrl+Enter 时回调，参数是编辑框里的当前文本
     void setOnRetranslate(std::function<void(const std::string &)> callback);
 
+    // 收藏当前原文和译文；返回 false 表示已在生词本里或保存失败
+    void setOnBookmark(
+        std::function<bool(const std::string &, const std::string &)> callback);
+
 private:
     HWND hwnd_ = nullptr;
     HWND edit_ = nullptr;
@@ -63,6 +67,10 @@ private:
     bool trackingMouse_ = false;
 
     std::function<void(const std::string &)> onRetranslate_;
+    std::function<bool(const std::string &, const std::string &)> onBookmark_;
+
+    // 收藏后的临时提示（"已收藏" / "已在生词本中"）
+    std::wstring bookmarkMessage_;
 
     void showInternal(
         const std::string &original,
@@ -89,6 +97,9 @@ private:
     [[nodiscard]] int translationScrollMax() const;
     [[nodiscard]] RECT translationTrackRect() const;
     [[nodiscard]] RECT translationThumbRect() const;
+    [[nodiscard]] RECT bookmarkRect() const;
+
+    void requestBookmark();
 
     // 命中判断
     [[nodiscard]] bool isOverDivider(POINT clientPoint) const;

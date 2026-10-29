@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <system_error>
+#include <utility>
 
 namespace
 {
@@ -60,6 +61,11 @@ namespace
 TrayIcon::~TrayIcon()
 {
     shutdown();
+}
+
+void TrayIcon::setOnOpenVocabulary(std::function<void()> callback)
+{
+    onOpenVocabulary_ = std::move(callback);
 }
 
 bool TrayIcon::initialize(HINSTANCE instance)
@@ -178,6 +184,12 @@ void TrayIcon::showContextMenu()
         MF_STRING,
         MENU_CONFIGURE,
         L"打开配置文件");
+
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        MENU_VOCABULARY,
+        L"生词本");
 
     AppendMenuW(
         menu,
@@ -315,6 +327,13 @@ LRESULT CALLBACK TrayIcon::windowProc(
 
             return 0;
         }
+
+        case MENU_VOCABULARY:
+            if (self->onOpenVocabulary_)
+            {
+                self->onOpenVocabulary_();
+            }
+            return 0;
 
         case MENU_EXIT:
             PostQuitMessage(0);

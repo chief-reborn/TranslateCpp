@@ -7,6 +7,8 @@
 #include "PopupWindow.h"
 #include "TextConverter.h"
 #include "TrayIcon.h"
+#include "Vocabulary.h"
+#include "VocabularyWindow.h"
 
 #include <atomic>
 #include <cstdint>
@@ -30,6 +32,7 @@ namespace
 
     TrayIcon g_trayIcon;
     PopupWindow g_popupWindow;
+    VocabularyWindow g_vocabularyWindow;
 
     Config g_config;
 
@@ -306,6 +309,29 @@ int WINAPI WinMain(
             std::thread(translateText, text, requestId).detach();
         });
 
+    // 弹窗里点「☆ 收藏」或按 Ctrl+D，把当前原文/译文存进生词本
+    g_popupWindow.setOnBookmark(
+        [](const std::string &original, const std::string &translated)
+        {
+            return Vocabulary::add(original, translated);
+        });
+
+    if (!g_vocabularyWindow.initialize(instance))
+    {
+        showFatalError(L"无法创建生词本窗口。");
+        g_trayIcon.shutdown();
+        g_popupWindow.close();
+        CloseHandle(singleInstanceMutex);
+        return 1;
+    }
+
+    // 托盘菜单打开生词本
+    g_trayIcon.setOnOpenVocabulary(
+        []()
+        {
+            g_vocabularyWindow.show();
+        });
+
     if (!g_trayIcon.initialize(instance))
     {
         showFatalError(L"无法创建系统托盘图标。");
@@ -398,6 +424,7 @@ int WINAPI WinMain(
     }
 
     g_popupWindow.close();
+    g_vocabularyWindow.close();
     g_trayIcon.shutdown();
 
     CloseHandle(singleInstanceMutex);

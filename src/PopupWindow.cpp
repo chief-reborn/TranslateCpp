@@ -35,6 +35,7 @@ namespace
     // IDC_ARROW / IDC_SIZENS 的宽字符版本：MinGW 默认把 IDC_* 展开成 char 版本
     const LPCWSTR kArrowCursor = MAKEINTRESOURCEW(32512);
     const LPCWSTR kSizeCursor = MAKEINTRESOURCEW(32645);
+    const LPCWSTR kHandCursor = MAKEINTRESOURCEW(32649);
 
     int scaled(int value, UINT dpi)
     {
@@ -304,6 +305,12 @@ void PopupWindow::setOnRetranslate(
     onRetranslate_ = std::move(callback);
 }
 
+void PopupWindow::setOnBookmark(
+    std::function<bool(const std::string &, const std::string &)> callback)
+{
+    onBookmark_ = std::move(callback);
+}
+
 void PopupWindow::show(
     const std::string &original,
     const std::string &translated)
@@ -331,6 +338,13 @@ void PopupWindow::showInternal(
     // 新内容：译文回到顶部，分配恢复自动
     translatedScroll_ = 0;
     originalAlloc_ = 0;
+
+    bookmarkMessage_.clear();
+
+    if (hwnd_ != nullptr)
+    {
+        KillTimer(hwnd_, 1);
+    }
 
     if (hwnd_ != nullptr && IsWindow(hwnd_))
     {
@@ -698,6 +712,49 @@ void PopupWindow::requestRetranslate()
     onRetranslate_(text);
 }
 
+// 收藏按钮在译文标题行右侧
+RECT PopupWindow::bookmarkRect() const
+{
+    RECT client{};
+
+    if (hwnd_ == nullptr || !IsWindow(hwnd_))
+    {
+        return client;
+    }
+
+    GetClientRect(hwnd_, &client);
+
+    const UINT dpi = windowDpi(hwnd_);
+
+    const Layout layout = computeLayout(
+        dpi, client.right, client.bottom, originalAlloc_);
+
+    const int width = scaled(92, dpi);
+
+    return RECT{
+        layout.contentRight - width,
+        layout.translatedLabelTop,
+        layout.contentRight,
+        layout.translatedLabelBottom};
+}
+
+void PopupWindow::requestBookmark()
+{
+    if (isError_ || translatedText_.empty() || !onBookmark_)
+    {
+        return;
+    }
+
+    const bool added = onBookmark_(
+        wideToUtf8(originalText_),
+        wideToUtf8(translatedText_));
+
+    bookmarkMessage_ = added ? L"已收藏" : L"已在生词本中";
+
+    SetTimer(hwnd_, 1, 1600, nullptr);
+    InvalidateRect(hwnd_, nullptr, TRUE);
+}
+
 // 编辑框子类化：Ctrl+Enter 重新翻译，其它消息交回给 EDIT
 LRESULT CALLBACK PopupWindow::editWindowProc(
     HWND hwnd,
@@ -710,15 +767,21 @@ LRESULT CALLBACK PopupWindow::editWindowProc(
 
     if (self != nullptr &&
         message == WM_KEYDOWN &&
-        wParam == VK_RETURN)
+        (wParam == VK_RETURN || wParam == 'D'))
     {
         const bool ctrlPressed =
             (GetKeyState(VK_CONTROL) & 0x8000) != 0 ||
             (GetKeyState(VK_RCONTROL) & 0x8000) != 0;
 
-        if (ctrlPressed)
+        if (ctrlPressed && wParam == VK_RETURN)
         {
             self->requestRetranslate();
+            return 0;
+        }
+
+        if (ctrlPressed && wParam == 'D')
+        {
+            self->requestBookmark();
             return 0;
         }
     }
@@ -1002,6 +1065,15 @@ LRESULT CALLBACK PopupWindow::windowProc(
         }
         break;
 
+    case WM_TIMER:
+        if (wParam == 1)
+        {
+            KillTimer(hwnd, 1);
+            self->bookmarkMessage_.clear();
+            InvalidateRect(hwnd, nullptr, TRUE);
+        }
+        return 0;
+
     case WM_CTLCOLOREDIT:
     {
         const HDC dc = reinterpret_cast<HDC>(wParam);
@@ -1042,9 +1114,14 @@ LRESULT CALLBACK PopupWindow::windowProc(
             const bool draggable =
                 self->isOverDivider(point) || self->isOverThumb(point);
 
+            const RECT bookmark = self->bookmarkRect();
+            const bool overBookmark =
+                PtInRect(&bookmark, point) != FALSE;
+
             SetCursor(LoadCursorW(
                 nullptr,
-                draggable ? kSizeCursor : kArrowCursor));
+                draggable ? kSizeCursor
+                          : (overBookmark ? kHandCursor : kArrowCursor)));
 
             return TRUE;
         }
@@ -1132,6 +1209,14 @@ LRESULT CALLBACK PopupWindow::windowProc(
         const POINT point{
             GET_X_LPARAM(lParam),
             GET_Y_LPARAM(lParam)};
+
+        const RECT bookmark = self->bookmarkRect();
+
+        if (PtInRect(&bookmark, point) != FALSE)
+        {
+            self->requestBookmark();
+            return 0;
+        }
 
         if (self->isOverDivider(point))
         {
@@ -1360,6 +1445,25 @@ void PopupWindow::paint(HWND hwnd)
         -1,
         &translatedLabel,
         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+    // 收藏按钮 / 收藏结果提示
+    if (!isError_ && !translatedText_.empty())
+    {
+        RECT bookmark = bookmarkRect();
+
+        SetTextColor(
+            hdc,
+            bookmarkMessage_.empty() ? RGB(150, 150, 150)
+                                     : RGB(40, 150, 80));
+
+        DrawTextW(
+            hdc,
+            bookmarkMessage_.empty() ? L"☆ 收藏" : bookmarkMessage_.c_str(),
+            -1,
+            &bookmark,
+            DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS |
+                DT_NOPREFIX);
+    }
 
     SelectObject(hdc, bodyFont);
 

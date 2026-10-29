@@ -44,6 +44,8 @@ add_executable(TranslateCpp WIN32
     src/PopupWindow.cpp
     src/TrayIcon.cpp
     src/StartupManager.cpp
+    src/Vocabulary.cpp
+    src/VocabularyWindow.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/TranslateCpp.rc"
 )
 
@@ -55,6 +57,9 @@ target_compile_definitions(TranslateCpp PRIVATE
     TRANSLATECPP_VERSION="${PROJECT_VERSION}"
     # 防止 windows.h 的 min/max 宏把 std::min/std::max 展开坏（MSVC 下会报 C2589）
     NOMINMAX
+    # 让 commctrl 等通用控件的宏走宽字符版本
+    UNICODE
+    _UNICODE
 )
 
 target_link_libraries(
@@ -63,6 +68,7 @@ target_link_libraries(
     nlohmann_json::nlohmann_json
     winhttp
     shell32
+    comctl32
 )
 
 if(MSVC)
