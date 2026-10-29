@@ -71,6 +71,9 @@ if(MSVC)
         /permissive-
         /utf-8
     )
+
+    # manifest 已经由 .rc 嵌入，链接器不要再生成一份，否则 CVT1100 重复资源
+    target_link_options(TranslateCpp PRIVATE /MANIFEST:NO)
 else()
     target_compile_options(TranslateCpp PRIVATE
         -Wall
