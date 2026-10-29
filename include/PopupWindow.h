@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <functional>
 #include <string>
 
 class PopupWindow
@@ -26,15 +27,17 @@ public:
     // 关闭悬浮窗
     void close();
 
-private:
-    enum class Pane
-    {
-        Original,
-        Translated
-    };
+    // 原文被修改后按 Ctrl+Enter 时回调，参数是编辑框里的当前文本
+    void setOnRetranslate(std::function<void(const std::string &)> callback);
 
+private:
     HWND hwnd_ = nullptr;
+    HWND edit_ = nullptr;
     HINSTANCE instance_ = nullptr;
+
+    WNDPROC editDefaultProc_ = nullptr;
+    HFONT editFont_ = nullptr;
+    UINT editFontDpi_ = 0;
 
     std::wstring originalText_;
     std::wstring translatedText_;
@@ -43,24 +46,23 @@ private:
     // 原文文本区的分配高度；0 表示还没算过
     int originalAlloc_ = 0;
 
-    // 两栏各自的滚动位置（像素）
-    int originalScroll_ = 0;
+    // 译文区的滚动位置
     int translatedScroll_ = 0;
-    Pane activePane_ = Pane::Translated;
 
     // 分隔条拖动
     bool draggingDivider_ = false;
     int dividerDragStartY_ = 0;
     int dividerDragStartAlloc_ = 0;
 
-    // 滚动条滑块拖动
+    // 译文滚动条拖动
     bool draggingThumb_ = false;
-    Pane thumbPane_ = Pane::Original;
     int thumbDragStartY_ = 0;
     int thumbDragStartScroll_ = 0;
 
     bool dividerHover_ = false;
     bool trackingMouse_ = false;
+
+    std::function<void(const std::string &)> onRetranslate_;
 
     void showInternal(
         const std::string &original,
@@ -70,25 +72,32 @@ private:
     // 计算窗口尺寸和两栏的默认分配
     void resizeToContent(HWND hwnd);
 
+    // 原文编辑框
+    void createEditControl();
+    void positionEditControl();
+    void updateEditFont(UINT dpi);
+    void updateEditScrollBar();
+    void syncEditText();
+    [[nodiscard]] std::wstring editTextWide() const;
+    [[nodiscard]] std::string editTextUtf8() const;
+    void requestRetranslate();
+
     // 布局
     [[nodiscard]] int dividerCenterY() const;
-    [[nodiscard]] RECT paneTextRect(Pane pane) const;
-    [[nodiscard]] int paneContentHeight(Pane pane) const;
-    [[nodiscard]] int paneTextHeight(Pane pane) const;
-    [[nodiscard]] int paneScrollMax(Pane pane) const;
-    [[nodiscard]] int &scrollOf(Pane pane);
-    [[nodiscard]] RECT trackRect(Pane pane) const;
-    [[nodiscard]] RECT thumbRect(Pane pane) const;
+    [[nodiscard]] RECT translationTextRect() const;
+    [[nodiscard]] int translationContentHeight() const;
+    [[nodiscard]] int translationScrollMax() const;
+    [[nodiscard]] RECT translationTrackRect() const;
+    [[nodiscard]] RECT translationThumbRect() const;
 
     // 命中判断
     [[nodiscard]] bool isOverDivider(POINT clientPoint) const;
-    [[nodiscard]] bool isOverThumb(Pane pane, POINT clientPoint) const;
-    [[nodiscard]] bool isOverTrack(Pane pane, POINT clientPoint) const;
-    [[nodiscard]] Pane paneAt(POINT clientPoint) const;
+    [[nodiscard]] bool isOverThumb(POINT clientPoint) const;
+    [[nodiscard]] bool isOverTrack(POINT clientPoint) const;
 
     // 滚动
-    void clampScrolls();
-    void scrollPaneBy(Pane pane, int delta);
+    void clampScroll();
+    void scrollTranslationBy(int delta);
     void applySplitOffset(int offset);
 
     static constexpr int BASE_WIDTH = 560;
@@ -98,6 +107,12 @@ private:
         L"TranslateCppPopupWindow";
 
     static LRESULT CALLBACK windowProc(
+        HWND hwnd,
+        UINT message,
+        WPARAM wParam,
+        LPARAM lParam);
+
+    static LRESULT CALLBACK editWindowProc(
         HWND hwnd,
         UINT message,
         WPARAM wParam,

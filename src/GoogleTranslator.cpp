@@ -305,6 +305,12 @@ std::string GoogleTranslator::translate(
         response.append(buffer.data(), downloaded);
     }
 
+    if (statusCode == 429)
+    {
+        throw std::runtime_error(
+            "请求过于频繁（HTTP 429），请稍后再试，或换一个代理节点。");
+    }
+
     if (statusCode != 200)
     {
         std::string message =

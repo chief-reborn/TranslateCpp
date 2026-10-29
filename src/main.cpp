@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 namespace
 {
@@ -176,23 +177,33 @@ namespace
             lParam);
     }
 
-    // 工作线程：读取剪贴板并翻译，结果投递给 UI 线程
-    void translateClipboard(std::uint64_t requestId)
+    // 把结果投递给 UI 线程，所有权随之转移
+    void postResult(std::unique_ptr<TranslationResult> result)
+    {
+        if (PostThreadMessageW(
+                g_mainThreadId,
+                WM_TRANSLATION_RESULT,
+                0,
+                reinterpret_cast<LPARAM>(result.get())))
+        {
+            // 所有权交给主线程
+            result.release();
+        }
+    }
+
+    // 工作线程：翻译给定文本
+    void translateText(std::string text, std::uint64_t requestId)
     {
         auto result = std::make_unique<TranslationResult>();
 
         result->id = requestId;
+        result->original = text;
 
         try
         {
-            const std::string text = getClipboardText();
-
-            result->original = text;
-
             if (text.empty())
             {
-                throw std::runtime_error(
-                    "剪贴板里没有可翻译的文本。");
+                throw std::runtime_error("没有可翻译的文本。");
             }
 
             GoogleTranslator translator(g_config.proxy);
@@ -207,15 +218,30 @@ namespace
             result->error = e.what();
         }
 
-        if (PostThreadMessageW(
-                g_mainThreadId,
-                WM_TRANSLATION_RESULT,
-                0,
-                reinterpret_cast<LPARAM>(result.get())))
+        postResult(std::move(result));
+    }
+
+    // 工作线程：读取剪贴板并翻译
+    void translateClipboard(std::uint64_t requestId)
+    {
+        std::string text;
+
+        try
         {
-            // 所有权交给主线程
-            result.release();
+            text = getClipboardText();
         }
+        catch (const std::exception &e)
+        {
+            auto result = std::make_unique<TranslationResult>();
+
+            result->id = requestId;
+            result->error = e.what();
+
+            postResult(std::move(result));
+            return;
+        }
+
+        translateText(std::move(text), requestId);
     }
 }
 
@@ -268,6 +294,17 @@ int WINAPI WinMain(
         CloseHandle(singleInstanceMutex);
         return 1;
     }
+
+    // 原文被编辑后按 Ctrl+Enter，用编辑框里的文本重新翻译
+    g_popupWindow.setOnRetranslate(
+        [](const std::string &text)
+        {
+            const auto requestId = g_requestCounter.fetch_add(1) + 1;
+
+            g_latestRequest.store(requestId);
+
+            std::thread(translateText, text, requestId).detach();
+        });
 
     if (!g_trayIcon.initialize(instance))
     {

@@ -12,7 +12,7 @@ namespace
 {
     // 96 DPI 下的设计值，运行时按窗口实际 DPI 缩放
     constexpr int kMargin = 18;
-    constexpr int kGutter = 14;        // 右侧留给滚动条的宽度
+    constexpr int kGutter = 14;        // 译文区右侧留给滚动条的宽度
     constexpr int kBarWidth = 6;
     constexpr int kTopPadding = 16;
     constexpr int kLabelHeight = 20;
@@ -28,6 +28,9 @@ namespace
         kTopPadding + kLabelHeight + kLabelGap +
         kBlockGap + kBlockGap + kLabelHeight + kLabelGap +
         kBottomPadding;
+
+    // 编辑框自带滚动条的宽度，量原文高度时要扣掉
+    constexpr int kEditScrollBar = 17;
 
     // IDC_ARROW / IDC_SIZENS 的宽字符版本：MinGW 默认把 IDC_* 展开成 char 版本
     const LPCWSTR kArrowCursor = MAKEINTRESOURCEW(32512);
@@ -112,6 +115,7 @@ namespace
         int margin = 0;
         int gutter = 0;
         int contentRight = 0;
+        int editRight = 0;
 
         int originalLabelTop = 0;
         int originalLabelBottom = 0;
@@ -137,6 +141,7 @@ namespace
         layout.margin = scaled(kMargin, dpi);
         layout.gutter = scaled(kGutter, dpi);
         layout.contentRight = clientWidth - layout.margin - layout.gutter;
+        layout.editRight = clientWidth - layout.margin;
 
         layout.originalLabelTop = scaled(kTopPadding, dpi);
         layout.originalLabelBottom =
@@ -293,6 +298,12 @@ bool PopupWindow::initialize(HINSTANCE instance)
     return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
 }
 
+void PopupWindow::setOnRetranslate(
+    std::function<void(const std::string &)> callback)
+{
+    onRetranslate_ = std::move(callback);
+}
+
 void PopupWindow::show(
     const std::string &original,
     const std::string &translated)
@@ -317,14 +328,14 @@ void PopupWindow::showInternal(
     translatedText_ = utf8ToWide(translated);
     isError_ = isError;
 
-    // 新内容：两栏都回到顶部，分配恢复自动
-    originalScroll_ = 0;
+    // 新内容：译文回到顶部，分配恢复自动
     translatedScroll_ = 0;
     originalAlloc_ = 0;
-    activePane_ = Pane::Translated;
 
     if (hwnd_ != nullptr && IsWindow(hwnd_))
     {
+        syncEditText();
+
         resizeToContent(hwnd_);
 
         InvalidateRect(hwnd_, nullptr, TRUE);
@@ -369,6 +380,9 @@ void PopupWindow::showInternal(
         return;
     }
 
+    createEditControl();
+    syncEditText();
+
     resizeToContent(hwnd_);
 
     ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
@@ -396,14 +410,20 @@ void PopupWindow::resizeToContent(HWND hwnd)
 
     const UINT dpi = windowDpi(hwnd);
     const int clientWidth = scaled(BASE_WIDTH, dpi);
-    const int contentWidth =
+
+    // 原文用编辑框，宽度要扣掉它自己的滚动条
+    const int originalWidth =
+        clientWidth - 2 * scaled(kMargin, dpi) -
+        scaled(kEditScrollBar, dpi);
+
+    const int translatedWidth =
         clientWidth - 2 * scaled(kMargin, dpi) - scaled(kGutter, dpi);
 
     const int measuredOriginal = measureTextHeight(
-        hwnd, dpi, originalText_, contentWidth);
+        hwnd, dpi, originalText_, originalWidth);
 
     const int measuredTranslated = measureTextHeight(
-        hwnd, dpi, translatedText_, contentWidth);
+        hwnd, dpi, translatedText_, translatedWidth);
 
     const int naturalOriginal = std::max(
         measuredOriginal, scaled(kMinPaneText, dpi));
@@ -482,7 +502,234 @@ void PopupWindow::resizeToContent(HWND hwnd)
         height,
         SWP_NOACTIVATE);
 
-    clampScrolls();
+    positionEditControl();
+    clampScroll();
+}
+
+void PopupWindow::createEditControl()
+{
+    if (edit_ != nullptr)
+    {
+        return;
+    }
+
+    edit_ = CreateWindowExW(
+        0,
+        L"EDIT",
+        L"",
+        WS_CHILD | WS_VISIBLE | ES_LEFT | ES_MULTILINE |
+            ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | ES_NOHIDESEL,
+        0, 0, 10, 10,
+        hwnd_,
+        nullptr,
+        instance_,
+        nullptr);
+
+    if (edit_ == nullptr)
+    {
+        return;
+    }
+
+    // 与翻译接口的长度上限保持一致
+    SendMessageW(edit_, EM_SETLIMITTEXT, 3000, 0);
+
+    // 去掉编辑框默认的左右内边距，让文字和标题对齐
+    SendMessageW(edit_, EM_SETMARGINS, 0x0003, 0);
+
+    SetWindowLongPtrW(
+        edit_,
+        GWLP_USERDATA,
+        reinterpret_cast<LONG_PTR>(this));
+
+    editDefaultProc_ = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(
+            edit_,
+            GWLP_WNDPROC,
+            reinterpret_cast<LONG_PTR>(editWindowProc)));
+
+    editFontDpi_ = 0;
+    updateEditFont(windowDpi(hwnd_));
+}
+
+void PopupWindow::updateEditFont(UINT dpi)
+{
+    if (edit_ == nullptr || editFontDpi_ == dpi)
+    {
+        return;
+    }
+
+    if (editFont_ != nullptr)
+    {
+        DeleteObject(editFont_);
+        editFont_ = nullptr;
+    }
+
+    editFont_ = createUiFont(dpi, 14);
+    editFontDpi_ = dpi;
+
+    SendMessageW(
+        edit_,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(editFont_),
+        TRUE);
+}
+
+void PopupWindow::positionEditControl()
+{
+    if (edit_ == nullptr || hwnd_ == nullptr)
+    {
+        return;
+    }
+
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+
+    const UINT dpi = windowDpi(hwnd_);
+    updateEditFont(dpi);
+
+    const Layout layout = computeLayout(
+        dpi, client.right, client.bottom, originalAlloc_);
+
+    MoveWindow(
+        edit_,
+        layout.margin,
+        layout.originalTextTop,
+        layout.editRight - layout.margin,
+        layout.originalTextHeight,
+        TRUE);
+
+    updateEditScrollBar();
+}
+
+void PopupWindow::syncEditText()
+{
+    if (edit_ == nullptr)
+    {
+        return;
+    }
+
+    const int length = GetWindowTextLengthW(edit_);
+
+    std::wstring current(static_cast<std::size_t>(length), L'\0');
+
+    if (length > 0)
+    {
+        GetWindowTextW(edit_, current.data(), length + 1);
+    }
+
+    // 内容一样就不要重设，避免打断用户正在编辑的光标位置
+    if (current == originalText_)
+    {
+        return;
+    }
+
+    SendMessageW(
+        edit_,
+        WM_SETTEXT,
+        0,
+        reinterpret_cast<LPARAM>(originalText_.c_str()));
+}
+
+std::wstring PopupWindow::editTextWide() const
+{
+    if (edit_ == nullptr)
+    {
+        return {};
+    }
+
+    const int length = GetWindowTextLengthW(edit_);
+
+    if (length <= 0)
+    {
+        return {};
+    }
+
+    std::wstring text(static_cast<std::size_t>(length), L'\0');
+
+    GetWindowTextW(edit_, text.data(), length + 1);
+
+    return text;
+}
+
+std::string PopupWindow::editTextUtf8() const
+{
+    const std::wstring text = editTextWide();
+
+    if (text.empty())
+    {
+        return {};
+    }
+
+    return wideToUtf8(text);
+}
+
+// 文本放得下就收起滚动条，避免短文本旁边挂一条空滚动条
+void PopupWindow::updateEditScrollBar()
+{
+    if (edit_ == nullptr || hwnd_ == nullptr)
+    {
+        return;
+    }
+
+    RECT rect{};
+    GetWindowRect(edit_, &rect);
+
+    const UINT dpi = windowDpi(hwnd_);
+    const int height = rect.bottom - rect.top;
+    const int width =
+        rect.right - rect.left - scaled(kEditScrollBar, dpi);
+
+    const int content = measureTextHeight(
+        hwnd_, dpi, editTextWide(), width);
+
+    ShowScrollBar(edit_, SB_VERT, content > height);
+}
+
+void PopupWindow::requestRetranslate()
+{
+    const std::string text = editTextUtf8();
+
+    if (text.empty() || !onRetranslate_)
+    {
+        MessageBeep(MB_ICONWARNING);
+        return;
+    }
+
+    onRetranslate_(text);
+}
+
+// 编辑框子类化：Ctrl+Enter 重新翻译，其它消息交回给 EDIT
+LRESULT CALLBACK PopupWindow::editWindowProc(
+    HWND hwnd,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam)
+{
+    auto *self = reinterpret_cast<PopupWindow *>(
+        GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+    if (self != nullptr &&
+        message == WM_KEYDOWN &&
+        wParam == VK_RETURN)
+    {
+        const bool ctrlPressed =
+            (GetKeyState(VK_CONTROL) & 0x8000) != 0 ||
+            (GetKeyState(VK_RCONTROL) & 0x8000) != 0;
+
+        if (ctrlPressed)
+        {
+            self->requestRetranslate();
+            return 0;
+        }
+    }
+
+    if (self != nullptr && self->editDefaultProc_ != nullptr)
+    {
+        return CallWindowProcW(
+            self->editDefaultProc_, hwnd, message, wParam, lParam);
+    }
+
+    return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
 int PopupWindow::dividerCenterY() const
@@ -501,7 +748,7 @@ int PopupWindow::dividerCenterY() const
     return layout.dividerY;
 }
 
-RECT PopupWindow::paneTextRect(Pane pane) const
+RECT PopupWindow::translationTextRect() const
 {
     RECT client{};
 
@@ -515,15 +762,6 @@ RECT PopupWindow::paneTextRect(Pane pane) const
     const Layout layout = computeLayout(
         windowDpi(hwnd_), client.right, client.bottom, originalAlloc_);
 
-    if (pane == Pane::Original)
-    {
-        return RECT{
-            layout.margin,
-            layout.originalTextTop,
-            layout.contentRight,
-            layout.originalTextTop + layout.originalTextHeight};
-    }
-
     return RECT{
         layout.margin,
         layout.translatedTextTop,
@@ -531,7 +769,7 @@ RECT PopupWindow::paneTextRect(Pane pane) const
         layout.translatedTextTop + layout.translatedTextHeight};
 }
 
-int PopupWindow::paneContentHeight(Pane pane) const
+int PopupWindow::translationContentHeight() const
 {
     if (hwnd_ == nullptr || !IsWindow(hwnd_))
     {
@@ -541,37 +779,26 @@ int PopupWindow::paneContentHeight(Pane pane) const
     RECT client{};
     GetClientRect(hwnd_, &client);
 
-    const int contentWidth =
-        client.right - 2 * scaled(kMargin, windowDpi(hwnd_)) -
-        scaled(kGutter, windowDpi(hwnd_));
+    const UINT dpi = windowDpi(hwnd_);
+    const int width =
+        client.right - 2 * scaled(kMargin, dpi) - scaled(kGutter, dpi);
 
-    return measureTextHeight(
-        hwnd_,
-        windowDpi(hwnd_),
-        pane == Pane::Original ? originalText_ : translatedText_,
-        contentWidth);
+    return measureTextHeight(hwnd_, dpi, translatedText_, width);
 }
 
-int PopupWindow::paneTextHeight(Pane pane) const
+int PopupWindow::translationScrollMax() const
 {
-    const RECT rect = paneTextRect(pane);
+    const RECT rect = translationTextRect();
 
-    return rect.bottom - rect.top;
+    return std::max(
+        0,
+        translationContentHeight() -
+            static_cast<int>(rect.bottom - rect.top));
 }
 
-int PopupWindow::paneScrollMax(Pane pane) const
+RECT PopupWindow::translationTrackRect() const
 {
-    return std::max(0, paneContentHeight(pane) - paneTextHeight(pane));
-}
-
-int &PopupWindow::scrollOf(Pane pane)
-{
-    return pane == Pane::Original ? originalScroll_ : translatedScroll_;
-}
-
-RECT PopupWindow::trackRect(Pane pane) const
-{
-    const RECT text = paneTextRect(pane);
+    const RECT text = translationTextRect();
 
     if (hwnd_ == nullptr)
     {
@@ -588,21 +815,22 @@ RECT PopupWindow::trackRect(Pane pane) const
     return RECT{barLeft, text.top, barRight, text.bottom};
 }
 
-RECT PopupWindow::thumbRect(Pane pane) const
+RECT PopupWindow::translationThumbRect() const
 {
-    const int maxScroll = paneScrollMax(pane);
+    const int maxScroll = translationScrollMax();
 
     if (maxScroll <= 0)
     {
         return RECT{};
     }
 
-    const RECT track = trackRect(pane);
+    const RECT track = translationTrackRect();
     const int trackHeight = track.bottom - track.top;
-    const int contentHeight = paneContentHeight(pane);
-    const int textHeight = paneTextHeight(pane);
+    const int contentHeight = translationContentHeight();
+    const RECT text = translationTextRect();
+    const int textHeight = text.bottom - text.top;
 
-    if (trackHeight <= 0 || contentHeight <= 0)
+    if (trackHeight <= 0 || contentHeight <= 0 || textHeight <= 0)
     {
         return RECT{};
     }
@@ -611,15 +839,11 @@ RECT PopupWindow::thumbRect(Pane pane) const
     const int minThumb = scaled(24, dpi);
 
     int thumbHeight = trackHeight * textHeight / contentHeight;
-    thumbHeight = std::max(minThumb, thumbHeight);
-    thumbHeight = std::min(trackHeight, thumbHeight);
+    thumbHeight = std::clamp(thumbHeight, std::min(minThumb, trackHeight), trackHeight);
 
     const int travel = trackHeight - thumbHeight;
-    const int offset =
-        pane == Pane::Original ? originalScroll_ : translatedScroll_;
-
     const int thumbTop =
-        track.top + travel * offset / std::max(1, maxScroll);
+        track.top + travel * translatedScroll_ / std::max(1, maxScroll);
 
     return RECT{
         track.left,
@@ -642,55 +866,43 @@ bool PopupWindow::isOverDivider(POINT clientPoint) const
            clientPoint.y <= center + half;
 }
 
-bool PopupWindow::isOverThumb(Pane pane, POINT clientPoint) const
+bool PopupWindow::isOverThumb(POINT clientPoint) const
 {
-    const RECT thumb = thumbRect(pane);
+    const RECT thumb = translationThumbRect();
 
     return thumb.bottom > thumb.top &&
            PtInRect(&thumb, clientPoint) != FALSE;
 }
 
-bool PopupWindow::isOverTrack(Pane pane, POINT clientPoint) const
+bool PopupWindow::isOverTrack(POINT clientPoint) const
 {
-    if (paneScrollMax(pane) <= 0)
+    if (translationScrollMax() <= 0)
     {
         return false;
     }
 
-    const RECT track = trackRect(pane);
+    const RECT track = translationTrackRect();
 
     return PtInRect(&track, clientPoint) != FALSE;
 }
 
-PopupWindow::Pane PopupWindow::paneAt(POINT clientPoint) const
+void PopupWindow::clampScroll()
 {
-    return clientPoint.y < dividerCenterY()
-               ? Pane::Original
-               : Pane::Translated;
+    translatedScroll_ = std::clamp(
+        translatedScroll_, 0, translationScrollMax());
 }
 
-void PopupWindow::clampScrolls()
+void PopupWindow::scrollTranslationBy(int delta)
 {
-    for (const Pane pane : {Pane::Original, Pane::Translated})
-    {
-        int &scroll = scrollOf(pane);
-        scroll = std::clamp(scroll, 0, paneScrollMax(pane));
-    }
-}
-
-void PopupWindow::scrollPaneBy(Pane pane, int delta)
-{
-    int &scroll = scrollOf(pane);
-
     const int target = std::clamp(
-        scroll + delta, 0, paneScrollMax(pane));
+        translatedScroll_ + delta, 0, translationScrollMax());
 
-    if (target == scroll)
+    if (target == translatedScroll_)
     {
         return;
     }
 
-    scroll = target;
+    translatedScroll_ = target;
     InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
@@ -709,14 +921,17 @@ void PopupWindow::applySplitOffset(int offset)
     const int minPane = scaled(kMinPaneText, dpi);
 
     const int maxAlloc =
-        client.bottom - scaled(kFixedHeight, dpi) - minPane;
+        static_cast<int>(client.bottom) -
+        scaled(kFixedHeight, dpi) - minPane;
 
     originalAlloc_ = std::clamp(
         offset,
         minPane,
         std::max(minPane, maxAlloc));
 
-    clampScrolls();
+    clampScroll();
+
+    positionEditControl();
     InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
@@ -729,6 +944,7 @@ void PopupWindow::close()
     }
 
     hwnd_ = nullptr;
+    edit_ = nullptr;
 }
 
 // 静态窗口消息处理函数
@@ -777,16 +993,40 @@ LRESULT CALLBACK PopupWindow::windowProc(
     case WM_ERASEBKGND:
         return 1;
 
+    case WM_COMMAND:
+        // 用户修改原文时，按需显示编辑框的滚动条
+        if (HIWORD(wParam) == EN_CHANGE &&
+            reinterpret_cast<HWND>(lParam) == self->edit_)
+        {
+            self->updateEditScrollBar();
+        }
+        break;
+
+    case WM_CTLCOLOREDIT:
+    {
+        const HDC dc = reinterpret_cast<HDC>(wParam);
+
+        SetTextColor(dc, RGB(70, 70, 70));
+        SetBkColor(dc, RGB(255, 255, 255));
+
+        return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
+    }
+
     case WM_MOUSEWHEEL:
     {
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         ScreenToClient(hwnd, &point);
 
+        // 原文区的滚轮由编辑框自己处理，这里只管译文区
+        if (point.y < self->dividerCenterY())
+        {
+            break;
+        }
+
         const UINT dpi = windowDpi(hwnd);
         const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
 
-        self->scrollPaneBy(
-            self->paneAt(point),
+        self->scrollTranslationBy(
             -delta / WHEEL_DELTA * scaled(kScrollLine, dpi) * 3);
 
         return 0;
@@ -800,9 +1040,7 @@ LRESULT CALLBACK PopupWindow::windowProc(
             ScreenToClient(hwnd, &point);
 
             const bool draggable =
-                self->isOverDivider(point) ||
-                self->isOverThumb(Pane::Original, point) ||
-                self->isOverThumb(Pane::Translated, point);
+                self->isOverDivider(point) || self->isOverThumb(point);
 
             SetCursor(LoadCursorW(
                 nullptr,
@@ -829,22 +1067,19 @@ LRESULT CALLBACK PopupWindow::windowProc(
 
         if (self->draggingThumb_)
         {
-            const Pane pane = self->thumbPane_;
-            const RECT track = self->trackRect(pane);
-            const RECT thumb = self->thumbRect(pane);
+            const RECT track = self->translationTrackRect();
+            const RECT thumb = self->translationThumbRect();
 
             const int travel =
                 (track.bottom - track.top) - (thumb.bottom - thumb.top);
 
-            const int maxScroll = self->paneScrollMax(pane);
+            const int maxScroll = self->translationScrollMax();
 
             if (travel > 0 && maxScroll > 0)
             {
                 const int delta = point.y - self->thumbDragStartY_;
 
-                int &scroll = self->scrollOf(pane);
-
-                scroll = std::clamp(
+                self->translatedScroll_ = std::clamp(
                     self->thumbDragStartScroll_ +
                         delta * maxScroll / travel,
                     0,
@@ -908,37 +1143,28 @@ LRESULT CALLBACK PopupWindow::windowProc(
             return 0;
         }
 
-        for (const Pane pane : {Pane::Original, Pane::Translated})
+        if (self->isOverThumb(point))
         {
-            if (self->isOverThumb(pane, point))
-            {
-                SetCapture(hwnd);
+            SetCapture(hwnd);
 
-                self->draggingThumb_ = true;
-                self->thumbPane_ = pane;
-                self->thumbDragStartY_ = point.y;
-                self->thumbDragStartScroll_ = self->scrollOf(pane);
-                return 0;
-            }
+            self->draggingThumb_ = true;
+            self->thumbDragStartY_ = point.y;
+            self->thumbDragStartScroll_ = self->translatedScroll_;
+            return 0;
         }
 
-        for (const Pane pane : {Pane::Original, Pane::Translated})
+        if (self->isOverTrack(point))
         {
-            if (self->isOverTrack(pane, point))
-            {
-                const RECT text = self->paneTextRect(pane);
+            const RECT text = self->translationTextRect();
 
-                self->scrollPaneBy(
-                    pane,
-                    point.y < self->thumbRect(pane).top
-                        ? -(text.bottom - text.top)
-                        : (text.bottom - text.top));
+            self->scrollTranslationBy(
+                point.y < self->translationThumbRect().top
+                    ? -(text.bottom - text.top)
+                    : (text.bottom - text.top));
 
-                return 0;
-            }
+            return 0;
         }
 
-        self->activePane_ = self->paneAt(point);
         break;
     }
 
@@ -973,8 +1199,6 @@ LRESULT CALLBACK PopupWindow::windowProc(
         const UINT dpi = windowDpi(hwnd);
         const int line = scaled(kScrollLine, dpi);
 
-        int page = 0;
-
         switch (wParam)
         {
         case VK_ESCAPE:
@@ -982,29 +1206,35 @@ LRESULT CALLBACK PopupWindow::windowProc(
             return 0;
 
         case VK_UP:
-            self->scrollPaneBy(self->activePane_, -line);
+            self->scrollTranslationBy(-line);
             return 0;
 
         case VK_DOWN:
-            self->scrollPaneBy(self->activePane_, line);
+            self->scrollTranslationBy(line);
             return 0;
 
         case VK_PRIOR:
-            page = self->paneTextHeight(self->activePane_) - line;
-            self->scrollPaneBy(self->activePane_, -page);
+        {
+            const RECT text = self->translationTextRect();
+
+            self->scrollTranslationBy(-(text.bottom - text.top - line));
             return 0;
+        }
 
         case VK_NEXT:
-            page = self->paneTextHeight(self->activePane_) - line;
-            self->scrollPaneBy(self->activePane_, page);
+        {
+            const RECT text = self->translationTextRect();
+
+            self->scrollTranslationBy(text.bottom - text.top - line);
             return 0;
+        }
 
         case VK_HOME:
-            self->scrollPaneBy(self->activePane_, -1000000);
+            self->scrollTranslationBy(-1000000);
             return 0;
 
         case VK_END:
-            self->scrollPaneBy(self->activePane_, 1000000);
+            self->scrollTranslationBy(1000000);
             return 0;
 
         default:
@@ -1032,7 +1262,6 @@ LRESULT CALLBACK PopupWindow::windowProc(
             suggested->bottom - suggested->top,
             SWP_NOZORDER | SWP_NOACTIVATE);
 
-        self->originalScroll_ = 0;
         self->translatedScroll_ = 0;
         self->originalAlloc_ = 0;
 
@@ -1050,6 +1279,7 @@ LRESULT CALLBACK PopupWindow::windowProc(
         if (self->hwnd_ == hwnd)
         {
             self->hwnd_ = nullptr;
+            self->edit_ = nullptr;
         }
         break;
     }
@@ -1105,7 +1335,19 @@ void PopupWindow::paint(HWND hwnd)
         &originalLabel,
         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 
+    // 提示：原文可直接编辑
+    SetTextColor(hdc, RGB(165, 165, 165));
+
+    DrawTextW(
+        hdc,
+        L"可直接编辑 · Ctrl+Enter 重新翻译",
+        -1,
+        &originalLabel,
+        DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+
     // 译文标题
+    SetTextColor(hdc, RGB(110, 110, 110));
+
     RECT translatedLabel{
         margin,
         layout.translatedLabelTop,
@@ -1121,56 +1363,42 @@ void PopupWindow::paint(HWND hwnd)
 
     SelectObject(hdc, bodyFont);
 
-    // 两栏正文各自裁剪、各自滚动
-    const auto drawPaneText =
-        [&](const std::wstring &text, const RECT &rect, int scroll,
-            COLORREF color)
-    {
-        const int contentHeight = measureTextHeight(
-            hwnd, dpi, text, rect.right - rect.left);
-
-        const int saved = SaveDC(hdc);
-
-        IntersectClipRect(hdc, rect.left, rect.top, rect.right, rect.bottom);
-
-        SetTextColor(hdc, color);
-
-        RECT textRect{
-            rect.left,
-            rect.top - scroll,
-            rect.right,
-            rect.top - scroll + contentHeight};
-
-        DrawTextW(
-            hdc,
-            text.c_str(),
-            -1,
-            &textRect,
-            DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
-
-        RestoreDC(hdc, saved);
-    };
-
-    const RECT originalRect{
-        margin,
-        layout.originalTextTop,
-        right,
-        layout.originalTextTop + layout.originalTextHeight};
-
-    drawPaneText(
-        originalText_, originalRect, originalScroll_, RGB(70, 70, 70));
-
+    // 译文正文：按滚动位置裁剪绘制
     const RECT translatedRect{
         margin,
         layout.translatedTextTop,
         right,
         layout.translatedTextTop + layout.translatedTextHeight};
 
-    drawPaneText(
-        translatedText_,
-        translatedRect,
-        translatedScroll_,
+    const int contentHeight = translationContentHeight();
+
+    const int saved = SaveDC(hdc);
+
+    IntersectClipRect(
+        hdc,
+        translatedRect.left,
+        translatedRect.top,
+        translatedRect.right,
+        translatedRect.bottom);
+
+    SetTextColor(
+        hdc,
         isError_ ? RGB(190, 45, 45) : RGB(25, 25, 25));
+
+    RECT textRect{
+        translatedRect.left,
+        translatedRect.top - translatedScroll_,
+        translatedRect.right,
+        translatedRect.top - translatedScroll_ + contentHeight};
+
+    DrawTextW(
+        hdc,
+        translatedText_.c_str(),
+        -1,
+        &textRect,
+        DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+
+    RestoreDC(hdc, saved);
 
     // 分隔条
     drawDivider(
@@ -1181,14 +1409,12 @@ void PopupWindow::paint(HWND hwnd)
         layout.dividerY,
         dividerHover_ || draggingDivider_);
 
-    // 两栏的滚动条
-    for (const Pane pane : {Pane::Original, Pane::Translated})
-    {
-        const RECT track = trackRect(pane);
-        const RECT thumb = thumbRect(pane);
-
-        drawScrollBar(hdc, dpi, track, thumb);
-    }
+    // 译文的滚动条
+    drawScrollBar(
+        hdc,
+        dpi,
+        translationTrackRect(),
+        translationThumbRect());
 
     SelectObject(hdc, oldFont);
 
