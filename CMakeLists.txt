@@ -102,6 +102,7 @@ install(TARGETS TranslateCpp RUNTIME DESTINATION .)
 install(FILES
     README.md
     LICENSE
+    THIRD_PARTY_NOTICES.md
     config.example.json
     DESTINATION .
 )
