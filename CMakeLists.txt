@@ -53,6 +53,8 @@ target_include_directories(TranslateCpp PRIVATE
 
 target_compile_definitions(TranslateCpp PRIVATE
     TRANSLATECPP_VERSION="${PROJECT_VERSION}"
+    # 防止 windows.h 的 min/max 宏把 std::min/std::max 展开坏（MSVC 下会报 C2589）
+    NOMINMAX
 )
 
 target_link_libraries(
