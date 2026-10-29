@@ -15,6 +15,11 @@ CMakeUserPresets.json
 # 本机配置（可能包含代理地址，不要提交）
 config.json
 
+# 个人数据：生词本
+vocabulary.json
+vocabulary.json.bak
+vocabulary.json.tmp
+
 # 编译生成的中间文件
 *.exe
 *.pdb
